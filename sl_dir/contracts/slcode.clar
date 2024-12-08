@@ -4,11 +4,11 @@
 ;; Constants
 (define-constant CONTRACT_OWNER tx-sender)
 (define-constant MINIMUM_INVESTMENT_AMOUNT u100)
-(define-constant DUE_DILIGENCE_DURATION u1209600) ;; 14 days in seconds
 (define-constant APPROVAL_THRESHOLD u500) ;; 50.0% represented as 500/1000
 (define-constant MAX_INVESTMENT u1000000000) ;; Maximum investment allowed for startups
 (define-constant MIN_TITLE_LENGTH u4)
 (define-constant MIN_PITCH_LENGTH u10)
+(define-constant MAX_EVALUATIONS u100) ;; Maximum number of evaluations allowed
 
 ;; Error codes
 (define-constant ERR_NOT_AUTHORIZED (err u100))
@@ -22,7 +22,7 @@
 (define-constant ERR_INVALID_MILESTONE_COUNT (err u108))
 (define-constant ERR_INVALID_TITLE (err u109))
 (define-constant ERR_INVALID_PITCH (err u110))
-(define-constant ERR_TIMESTAMP_ORACLE_MISSING (err u111))
+(define-constant ERR_MAX_EVALUATIONS_REACHED (err u111))
 
 ;; Data Maps and Variables
 (define-map Startups
@@ -34,8 +34,7 @@
         total-funding: uint,
         milestone-count: uint,
         current-milestone: uint,
-        start-timestamp: uint,
-        end-timestamp: uint,
+        evaluation-count: uint,
         status: (string-ascii 20),
         total-positive-eval: uint,
         total-negative-eval: uint,
@@ -68,7 +67,6 @@
 )
 
 (define-data-var startup-counter uint u0)
-(define-data-var timestamp-oracle principal (default-to tx-sender (contract-call? .timestamp-contract get-oracle-address)))
 
 ;; Private functions
 (define-private (is-contract-owner)
@@ -97,10 +95,6 @@
 
 (define-private (is-valid-pitch (pitch (string-ascii 500)))
     (>= (len pitch) MIN_PITCH_LENGTH)
-)
-
-(define-private (get-current-timestamp)
-    (contract-call? .timestamp-contract get-current-timestamp)
 )
 
 (define-private (validate-and-process-eval (support-vote bool) (eval-weight uint) (eval-data (tuple (total-positive-eval uint) (total-negative-eval uint) (total-eval-weight uint))))
@@ -135,8 +129,7 @@
         total-funding: uint,
         milestone-count: uint,
         current-milestone: uint,
-        start-timestamp: uint,
-        end-timestamp: uint,
+        evaluation-count: uint,
         status: (string-ascii 20),
         total-positive-eval: uint,
         total-negative-eval: uint,
@@ -167,10 +160,7 @@
         (asserts! (is-valid-amount total-funding) ERR_INVALID_AMOUNT)
         (asserts! (and (> milestone-count u0) (<= milestone-count u10)) ERR_INVALID_MILESTONE_COUNT)
         
-        (let (
-            (startup-id (+ (var-get startup-counter) u1))
-            (current-timestamp (get-current-timestamp))
-        )
+        (let ((startup-id (+ (var-get startup-counter) u1)))
             (map-set Startups
                 { startup-id: startup-id }
                 {
@@ -180,8 +170,7 @@
                     total-funding: total-funding,
                     milestone-count: milestone-count,
                     current-milestone: u0,
-                    start-timestamp: current-timestamp,
-                    end-timestamp: (+ current-timestamp DUE_DILIGENCE_DURATION),
+                    evaluation-count: u0,
                     status: "ACTIVE",
                     total-positive-eval: u0,
                     total-negative-eval: u0,
@@ -194,42 +183,16 @@
     )
 )
 
-(define-public (add-milestone (startup-id uint) 
-                            (milestone-id uint)
-                            (funding uint)
-                            (deliverables (string-ascii 200)))
-    (begin
-        (asserts! (is-valid-pitch deliverables) ERR_INVALID_PITCH)
-        (let ((startup (unwrap! (map-get? Startups {startup-id: startup-id}) ERR_INVALID_STARTUP)))
-            (asserts! (is-valid-startup-id startup-id) ERR_INVALID_STARTUP)
-            (asserts! (is-valid-amount funding) ERR_INVALID_AMOUNT)
-            (asserts! (is-valid-milestone-id milestone-id (get milestone-count startup)) ERR_MILESTONE_INVALID)
-            (asserts! (is-eq (get founder startup) tx-sender) ERR_NOT_AUTHORIZED)
-            
-            (map-set Milestones
-                { startup-id: startup-id, milestone-id: milestone-id }
-                {
-                    funding: funding,
-                    deliverables: deliverables,
-                    status: "PENDING",
-                    progress-report: none
-                }
-            )
-            (ok true)
-        )
-    )
-)
-
 (define-public (evaluate-startup (startup-id uint) (support bool) (investment-amount uint))
     (let (
         (startup (unwrap! (map-get? Startups {startup-id: startup-id}) ERR_INVALID_STARTUP))
-        (current-timestamp (get-current-timestamp))
         (eval-weight (calculate-eval-weight investment-amount))
         (safe-support (validate-support-bool support))
     )
         (asserts! (is-valid-startup-id startup-id) ERR_INVALID_STARTUP)
         (asserts! (>= investment-amount MINIMUM_INVESTMENT_AMOUNT) ERR_INSUFFICIENT_INVESTMENT)
-        (asserts! (<= current-timestamp (get end-timestamp startup)) ERR_EVALUATION_CLOSED)
+        (asserts! (< (get evaluation-count startup) MAX_EVALUATIONS) ERR_EVALUATION_CLOSED)
+        (asserts! (is-eq (get status startup) "ACTIVE") ERR_EVALUATION_CLOSED)
         (asserts! (is-none (map-get? Evaluations {startup-id: startup-id, investor: tx-sender})) ERR_ALREADY_EVALUATED)
         
         (try! (stx-transfer? investment-amount tx-sender (as-contract tx-sender)))
@@ -256,7 +219,9 @@
         )
             (map-set Startups
                 {startup-id: startup-id}
-                (safe-merge-startup-evals startup updated-evals)
+                (merge (safe-merge-startup-evals startup updated-evals)
+                    { evaluation-count: (+ (get evaluation-count startup) u1) }
+                )
             )
             (ok true)
         )
@@ -322,6 +287,28 @@
     )
 )
 
+(define-read-only (get-startup-result (startup-id uint))
+    (let ((startup (unwrap! (map-get? Startups {startup-id: startup-id}) ERR_INVALID_STARTUP)))
+        (asserts! (is-valid-startup-id startup-id) ERR_INVALID_STARTUP)
+        (let (
+            (total-evals (get total-eval-weight startup))
+            (positive-evals (get total-positive-eval startup))
+            (eval-count (get evaluation-count startup))
+        )
+            (if (>= eval-count MAX_EVALUATIONS)
+                (if (and
+                    (> total-evals u0)
+                    (>= (* positive-evals u1000) (* total-evals APPROVAL_THRESHOLD))
+                )
+                    (ok "APPROVED")
+                    (ok "REJECTED")
+                )
+                (ok "EVALUATION_ACTIVE")
+            )
+        )
+    )
+)
+
 ;; Read-only functions
 (define-read-only (get-startup (startup-id uint))
     (map-get? Startups {startup-id: startup-id})
@@ -333,36 +320,4 @@
 
 (define-read-only (get-evaluation (startup-id uint) (investor principal))
     (map-get? Evaluations {startup-id: startup-id, investor: investor})
-)
-
-(define-read-only (get-startup-result (startup-id uint))
-    (let ((startup (unwrap! (map-get? Startups {startup-id: startup-id}) ERR_INVALID_STARTUP)))
-        (asserts! (is-valid-startup-id startup-id) ERR_INVALID_STARTUP)
-        (let ((current-timestamp (get-current-timestamp)))
-            (if (>= current-timestamp (get end-timestamp startup))
-                (let (
-                    (total-evals (get total-eval-weight startup))
-                    (positive-evals (get total-positive-eval startup))
-                )
-                    (if (and
-                        (> total-evals u0)
-                        (>= (* positive-evals u1000) (* total-evals APPROVAL_THRESHOLD))
-                    )
-                        (ok "APPROVED")
-                        (ok "REJECTED")
-                    )
-                )
-                (ok "EVALUATION_ACTIVE")
-            )
-        )
-    )
-)
-
-;; Admin function to update timestamp oracle address
-(define-public (set-timestamp-oracle (new-oracle principal))
-    (begin
-        (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
-        (var-set timestamp-oracle new-oracle)
-        (ok true)
-    )
 )
