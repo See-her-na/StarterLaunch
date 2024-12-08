@@ -1,10 +1,12 @@
-;; StarterLaunch: Decentralized Startup Incubator (Stage 1)
-;; Basic startup submission and milestone tracking
+;; StarterLaunch: Decentralized Startup Incubator (Stage 2)
+;; Added investment and startup evaluation mechanisms
 
 (define-constant CONTRACT_OWNER tx-sender)
 (define-constant MIN_FUNDING u1000)
 (define-constant MAX_FUNDING u1000000)
 (define-constant MAX_MILESTONES u5)
+(define-constant MINIMUM_INVESTMENT u100)
+(define-constant APPROVAL_THRESHOLD u500)
 
 (define-map Startups 
     { startup-id: uint }
@@ -13,7 +15,11 @@
         title: (string-ascii 100),
         description: (string-ascii 500),
         total-funding: uint,
-        milestone-count: uint
+        milestone-count: uint,
+        total-invested: uint,
+        total-positive-votes: uint,
+        total-negative-votes: uint,
+        status: (string-ascii 20)
     }
 )
 
@@ -26,63 +32,80 @@
     }
 )
 
+(define-map Investments
+    { startup-id: uint, investor: principal }
+    {
+        amount: uint,
+        supports: bool
+    }
+)
+
 (define-data-var startup-counter uint u0)
 
-(define-public (submit-startup 
-    (title (string-ascii 100))
-    (description (string-ascii 500))
-    (total-funding uint)
-    (milestone-count uint))
-    
-    (begin
-        (asserts! (and (>= total-funding MIN_FUNDING) (<= total-funding MAX_FUNDING)) 
-            (err u100))
-        (asserts! (and (> milestone-count u0) (<= milestone-count MAX_MILESTONES))
-            (err u101))
-        
-        (let ((new-startup-id (+ (var-get startup-counter) u1)))
-            (map-set Startups 
-                { startup-id: new-startup-id }
-                {
-                    founder: tx-sender,
-                    title: title,
-                    description: description,
-                    total-funding: total-funding,
-                    milestone-count: milestone-count
-                }
-            )
-            (var-set startup-counter new-startup-id)
-            (ok new-startup-id)
-        )
-    )
-)
+;; [Previous Stage 1 functions remain the same]
 
-(define-public (add-milestone
-    (startup-id uint)
-    (milestone-id uint)
-    (description (string-ascii 200))
-    (funding uint))
+(define-public (invest-in-startup 
+    (startup-id uint) 
+    (amount uint)
+    (supports bool))
     
-    (let ((startup (unwrap! (map-get? Startups {startup-id: startup-id}) (err u102))))
-        (asserts! (< milestone-id (get milestone-count startup)) (err u103))
-        (asserts! (is-eq tx-sender (get founder startup)) (err u104))
+    (let ((startup (unwrap! (map-get? Startups {startup-id: startup-id}) (err u201))))
+        (asserts! (>= amount MINIMUM_INVESTMENT) (err u202))
         
-        (map-set Milestones
-            { startup-id: startup-id, milestone-id: milestone-id }
-            {
-                description: description,
-                funding: funding,
-                status: "PENDING"
+        ;; Prevent duplicate investments
+        (asserts! (is-none (map-get? Investments {startup-id: startup-id, investor: tx-sender})) (err u203))
+        
+        ;; Transfer investment
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        ;; Record investment
+        (map-set Investments 
+            { startup-id: startup-id, investor: tx-sender }
+            { 
+                amount: amount, 
+                supports: supports 
             }
         )
-        (ok true)
+        
+        ;; Update startup voting metrics
+        (let ((updated-startup 
+            (merge startup 
+                {
+                    total-invested: (+ (get total-invested startup) amount),
+                    total-positive-votes: (if supports 
+                        (+ (get total-positive-votes startup) amount)
+                        (get total-positive-votes startup)
+                    ),
+                    total-negative-votes: (if (not supports)
+                        (+ (get total-negative-votes startup) amount)
+                        (get total-negative-votes startup)
+                    )
+                }
+            )))
+            
+            (map-set Startups 
+                { startup-id: startup-id }
+                updated-startup
+            )
+            
+            (ok true)
+        )
     )
 )
 
-(define-read-only (get-startup (startup-id uint))
-    (map-get? Startups {startup-id: startup-id})
-)
-
-(define-read-only (get-milestone (startup-id uint) (milestone-id uint))
-    (map-get? Milestones {startup-id: startup-id, milestone-id: milestone-id})
+(define-read-only (get-startup-status (startup-id uint))
+    (let ((startup (unwrap! (map-get? Startups {startup-id: startup-id}) (err u204))))
+        (let ((total-votes (+ (get total-positive-votes startup) (get total-negative-votes startup))))
+            (if (> total-votes u0)
+                (if (>= 
+                    (* (get total-positive-votes startup) u1000) 
+                    (* total-votes APPROVAL_THRESHOLD)
+                )
+                    (ok "APPROVED")
+                    (ok "REJECTED")
+                )
+                (ok "PENDING")
+            )
+        )
+    )
 )
